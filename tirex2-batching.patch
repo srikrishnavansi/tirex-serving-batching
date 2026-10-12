@@ -1,0 +1,390 @@
+diff --git a/inference/README.md b/inference/README.md
+index 6efd63c..71788d7 100644
+--- a/inference/README.md
++++ b/inference/README.md
+@@ -176,7 +176,7 @@ resp = requests.post(
+ print(resp.json())
+ ```
+ 
+-Every request is batched, so provide a list of timeseries as context, even when you only forecast a single timeseries. Bigger batch sizes are more efficient for the hardware, but too big batch sizes can lead to out of memory errors. There isn't any internal batching done, so the consumer of the API is responsible to call with an appropriate batch size for the hardware.
++Every request is batched, so provide a list of timeseries as context, even when you only forecast a single timeseries. Bigger batch sizes are more efficient for the hardware, but too big batch sizes can lead to out of memory errors. Concurrent requests are also batched inside the server: requests that arrive within `BATCH_MAX_WAIT_MS` of each other (up to `BATCH_MAX_SIZE` series) are forecast in one model call and the results are split back per request. Set `BATCHING_ENABLED=0` to make one model call per request. Prometheus metrics (request count, batch size, queue wait, model latency, p50/p95 request latency) are served at `/metrics`.
+ 
+ The HTTP API also provides `/univariate/forecast/quantiles` and `/multivariate/forecast/quantiles`, where the 10, 20, 30, 40, 50 (mean), 60, 70, 80 and 90% quantiles are returned, using the same arguments as the `/univariate/forecast/mean` and `/multivariate/forecast/mean` endpoints respectively.
+ 
+@@ -238,6 +238,9 @@ You can set these env variables when running the container using the -e env flag
+ | **MODEL_DEVICE**                            | `cpu`                                 | Device to run the model on (`cpu` or `cuda`).                   |
+ | **HTTP_HOST**                               | `0.0.0.0`                             | Host the HTTP server binds to.                                  |
+ | **HTTP_PORT**                               | `8000`                                | Port the HTTP server binds to.                                  |
++| **BATCHING_ENABLED**                        | `1`                                   | Merge concurrent requests into batched model calls (1=True, 0=False). |
++| **BATCH_MAX_SIZE**                          | `256`                                 | Most series per batched model call. A larger single request still runs whole. |
++| **BATCH_MAX_WAIT_MS**                       | `10`                                  | How long the oldest waiting request is held for others to join its batch. |
+ | **MQTT_ENABLED**                            | `0`                                   | Enable MQTT client functionality (1=True, 0=False).             |
+ | **MQTT_BROKER_HOST**                        | `None`                                | Hostname or IP address of the MQTT broker.                      |
+ | **MQTT_BROKER_PORT**                        | `None`                                | Port of the MQTT broker.                                        |
+diff --git a/inference/app/batching.py b/inference/app/batching.py
+new file mode 100644
+index 0000000..e8a1f24
+--- /dev/null
++++ b/inference/app/batching.py
+@@ -0,0 +1,132 @@
++# Licensed under the Apache License, Version 2.0; see LICENSE for details.
++
++"""Dynamic request batching for the forecast endpoints.
++
++Concurrent requests are collected until ``max_batch_size`` series are waiting or
++``max_wait_ms`` has passed since the oldest one arrived, then run as one model
++call per ``prediction_length``. Each caller gets back exactly the forecasts for
++its own series, in its own order. Requests are never split across model calls.
++"""
++
++import asyncio
++import time
++from collections import defaultdict
++from dataclasses import dataclass, field
++
++from starlette.concurrency import run_in_threadpool
++
++from app import metrics
++
++
++def _timed(predict_fn, contexts, prediction_length):
++    start = time.perf_counter()
++    forecasts = predict_fn(contexts, prediction_length)
++    if len(forecasts) != len(contexts):  # results are routed by position, so this must hold
++        raise RuntimeError(f"model returned {len(forecasts)} forecasts for {len(contexts)} series")
++    return forecasts, start, time.perf_counter()
++
++
++async def _call_model(predict_fn, contexts, prediction_length, arrivals):
++    """Run one model call off the event loop and record batch size, queue wait and model latency."""
++    forecasts, start, end = await run_in_threadpool(_timed, predict_fn, contexts, prediction_length)
++    metrics.batch_size.observe(len(contexts))
++    metrics.model_latency.observe(end - start)
++    for arrived in arrivals:
++        metrics.queue_wait.observe(start - arrived)
++    return forecasts
++
++
++def unbatched(predict_fn):
++    """Stock behaviour: each request makes its own model call on the shared thread pool."""
++
++    async def predict(contexts, prediction_length):
++        return await _call_model(predict_fn, contexts, prediction_length, [time.perf_counter()])
++
++    return predict
++
++
++@dataclass
++class _Pending:
++    contexts: list
++    prediction_length: int
++    future: asyncio.Future
++    arrived: float = field(default_factory=time.perf_counter)
++
++
++def _fail(item: _Pending, exc: BaseException) -> None:
++    if not item.future.done():
++        item.future.set_exception(exc)
++
++
++class MicroBatcher:
++    """Merges concurrent ``predict(contexts, prediction_length)`` calls into batched model calls."""
++
++    def __init__(self, predict_fn, max_batch_size: int = 256, max_wait_ms: float = 10.0):
++        self.predict_fn = predict_fn  # sync: (list of series, prediction_length) -> one forecast per series
++        self.max_batch_size = max_batch_size
++        self.max_wait = max_wait_ms / 1000
++        self._queue: asyncio.Queue | None = None
++        self._worker: asyncio.Task | None = None
++
++    async def predict(self, contexts, prediction_length):
++        contexts = list(contexts)
++        if not contexts:  # keep the stock error for an empty request instead of silently returning []
++            return await _call_model(self.predict_fn, contexts, prediction_length, [time.perf_counter()])
++        if self._worker is None:  # created lazily so it binds to the server's running event loop
++            self._queue = asyncio.Queue()  # ponytail: unbounded; add a max size + 503 if overload matters
++            self._worker = asyncio.create_task(self._run())
++        item = _Pending(contexts, prediction_length, asyncio.get_running_loop().create_future())
++        self._queue.put_nowait(item)
++        return await item.future
++
++    async def _run(self):
++        carry = None
++        while True:
++            first = carry or await self._queue.get()
++            carry, batch, size = None, [first], len(first.contexts)
++            # The window counts from the oldest request, so requests that queued up while
++            # the model was busy are dispatched at once instead of waiting another window.
++            deadline = first.arrived + self.max_wait
++            while size < self.max_batch_size:
++                timeout = deadline - time.perf_counter()
++                try:
++                    if timeout <= 0:
++                        item = self._queue.get_nowait()
++                    else:
++                        item = await asyncio.wait_for(self._queue.get(), timeout)
++                except (asyncio.QueueEmpty, TimeoutError):
++                    break
++                if size + len(item.contexts) > self.max_batch_size:
++                    carry = item  # does not fit: it opens the next batch
++                    break
++                batch.append(item)
++                size += len(item.contexts)
++
++            by_length = defaultdict(list)
++            for item in batch:
++                by_length[item.prediction_length].append(item)
++            for prediction_length, items in by_length.items():
++                await self._run_group(items, prediction_length)
++
++    async def _run_group(self, items: list[_Pending], prediction_length: int) -> None:
++        items = [item for item in items if not item.future.done()]  # drop callers that already went away
++        if not items:
++            return
++        contexts = [series for item in items for series in item.contexts]
++        try:
++            forecasts = await _call_model(self.predict_fn, contexts, prediction_length, [i.arrived for i in items])
++        except Exception as exc:
++            if len(items) == 1:
++                _fail(items[0], exc)
++                return
++            # One bad request must not fail its batch-mates: rerun each request on its own.
++            for item in items:
++                await self._run_group([item], prediction_length)
++            return
++
++        start = 0
++        for item in items:
++            end = start + len(item.contexts)
++            if not item.future.done():
++                item.future.set_result(forecasts[start:end])
++            start = end
+diff --git a/inference/app/config.py b/inference/app/config.py
+index 633a457..7ce16bd 100644
+--- a/inference/app/config.py
++++ b/inference/app/config.py
+@@ -11,6 +11,10 @@ class Settings(BaseSettings):
+     http_port: int = 8000
+     http_host: str = "0.0.0.0"
+ 
++    batching_enabled: int = 1
++    batch_max_size: int = 256
++    batch_max_wait_ms: float = 10.0
++
+     mqtt_enabled: int = 0
+     mqtt_broker_host: str | None = None
+     mqtt_broker_port: int | None = None
+diff --git a/inference/app/http_server.py b/inference/app/http_server.py
+index 2d36353..50febf0 100644
+--- a/inference/app/http_server.py
++++ b/inference/app/http_server.py
+@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
+ from fastmcp import FastMCP
+ from pydantic import BaseModel
+ 
++from app import metrics
++from app.batching import MicroBatcher, unbatched
+ from app.config import Settings
+ from app.model import Tirex2Model
+ from tirex2 import TimeseriesType
+@@ -17,6 +19,12 @@ model.warmup()
+ 
+ 
+ app = FastAPI(title="TiRex V2 API")
++metrics.install(app)
++
++if settings.batching_enabled:
++    predict = MicroBatcher(model.predict, settings.batch_max_size, settings.batch_max_wait_ms).predict
++else:
++    predict = unbatched(model.predict)
+ 
+ MEDIAN_QUANTILE_INDEX = 4
+ 
+@@ -70,15 +78,15 @@ class UnivariateForecastRequest(BaseModel):
+ 
+ 
+ @app.post("/univariate/forecast/mean")
+-def forecast_mean(req: UnivariateForecastRequest) -> list[list[float]]:
+-    forecasts = model.predict(req.to_timeseries(), req.prediction_length)
++async def forecast_mean(req: UnivariateForecastRequest) -> list[list[float]]:
++    forecasts = await predict(req.to_timeseries(), req.prediction_length)
+     # forecasts: [variate, quantile, timestep]; single variate -> f[0].
+     return [f[0, MEDIAN_QUANTILE_INDEX, :].tolist() for f in forecasts]
+ 
+ 
+ @app.post("/univariate/forecast/quantiles")
+-def forecast_quantiles(req: UnivariateForecastRequest) -> list[list[list[float]]]:
+-    forecasts = model.predict(req.to_timeseries(), req.prediction_length)
++async def forecast_quantiles(req: UnivariateForecastRequest) -> list[list[list[float]]]:
++    forecasts = await predict(req.to_timeseries(), req.prediction_length)
+     # forecasts: [variate, quantile, timestep]; single variate -> f[0].
+     return [f[0].tolist() for f in forecasts]
+ 
+@@ -99,17 +107,17 @@ class MultivariateForecastRequest(BaseModel):
+ 
+ 
+ @app.post("/multivariate/forecast/mean")
+-def multivariate_forecast_mean(req: MultivariateForecastRequest) -> list[list[list[float]]]:
++async def multivariate_forecast_mean(req: MultivariateForecastRequest) -> list[list[list[float]]]:
+     contexts = [s.to_timeseries() for s in req.context]
+-    forecasts = model.predict(contexts, req.prediction_length)
++    forecasts = await predict(contexts, req.prediction_length)
+     # forecasts: [variate, quantile, timestep]; keep all variates -> f[:, ...].
+     return [f[:, MEDIAN_QUANTILE_INDEX, :].tolist() for f in forecasts]
+ 
+ 
+ @app.post("/multivariate/forecast/quantiles")
+-def multivariate_forecast_quantiles(req: MultivariateForecastRequest) -> list[list[list[list[float]]]]:
++async def multivariate_forecast_quantiles(req: MultivariateForecastRequest) -> list[list[list[list[float]]]]:
+     contexts = [s.to_timeseries() for s in req.context]
+-    forecasts = model.predict(contexts, req.prediction_length)
++    forecasts = await predict(contexts, req.prediction_length)
+     # forecasts: [variate, quantile, timestep]; keep all variates -> f.
+     return [f.tolist() for f in forecasts]
+ 
+@@ -135,7 +143,7 @@ async def tirex_model(context: list[float], prediction_length: int) -> str:
+ 
+     input_length = len(context)
+     ts = TimeseriesType(target=_to_tensor([context]), past_covariates=None, future_covariates=None)
+-    forecasts = model.predict([ts], prediction_length)
++    forecasts = await predict([ts], prediction_length)
+     # forecast: [variate, quantile, timestep]; single variate -> [0], median quantile.
+     mean = forecasts[0][0, MEDIAN_QUANTILE_INDEX, :].tolist()
+ 
+@@ -168,7 +176,7 @@ async def tirex_model_multivariate(
+         past_covariates=_to_tensor(past_covariates),
+         future_covariates=_to_tensor(future_covariates),
+     )
+-    forecasts = model.predict([ts], prediction_length)
++    forecasts = await predict([ts], prediction_length)
+     # forecast: [variate, quantile, timestep]; take the median quantile per variate.
+     mean = forecasts[0][:, MEDIAN_QUANTILE_INDEX, :].tolist()
+ 
+diff --git a/inference/app/metrics.py b/inference/app/metrics.py
+new file mode 100644
+index 0000000..8a0c9de
+--- /dev/null
++++ b/inference/app/metrics.py
+@@ -0,0 +1,122 @@
++# Licensed under the Apache License, Version 2.0; see LICENSE for details.
++
++"""Hand-written Prometheus text metrics for the forecast server.
++
++All observations happen on the event-loop thread, so no locks are needed.
++"""
++
++import bisect
++import time
++from collections import Counter, deque
++
++from fastapi import FastAPI
++from fastapi.responses import PlainTextResponse
++
++LATENCY_BUCKETS = (0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
++BATCH_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
++FORECAST_PATHS = ("/univariate/", "/multivariate/")
++
++
++class Histogram:
++    def __init__(self, name: str, help: str, buckets):
++        self.name, self.help, self.buckets = name, help, tuple(buckets)
++        self.counts = [0] * len(self.buckets)
++        self.sum = 0.0
++        self.count = 0
++
++    def observe(self, value: float) -> None:
++        i = bisect.bisect_left(self.buckets, value)  # first bucket with le >= value
++        if i < len(self.counts):
++            self.counts[i] += 1
++        self.sum += value
++        self.count += 1
++
++    def render(self) -> list[str]:
++        lines = [f"# HELP {self.name} {self.help}", f"# TYPE {self.name} histogram"]
++        cumulative = 0
++        for le, n in zip(self.buckets, self.counts):
++            cumulative += n
++            lines.append(f'{self.name}_bucket{{le="{le}"}} {cumulative}')
++        lines += [
++            f'{self.name}_bucket{{le="+Inf"}} {self.count}',
++            f"{self.name}_sum {self.sum}",
++            f"{self.name}_count {self.count}",
++        ]
++        return lines
++
++
++class WindowSummary:
++    """p50/p95 over the most recent requests, plus lifetime sum/count."""
++
++    def __init__(self, name: str, help: str, window: int = 1000, quantiles=(0.5, 0.95)):
++        self.name, self.help, self.quantiles = name, help, quantiles
++        self.recent: deque[float] = deque(maxlen=window)
++        self.sum = 0.0
++        self.count = 0
++
++    def observe(self, value: float) -> None:
++        self.recent.append(value)
++        self.sum += value
++        self.count += 1
++
++    def render(self) -> list[str]:
++        lines = [f"# HELP {self.name} {self.help}", f"# TYPE {self.name} summary"]
++        ordered = sorted(self.recent)
++        for q in self.quantiles:
++            value = ordered[min(len(ordered) - 1, int(q * len(ordered)))] if ordered else float("nan")
++            lines.append(f'{self.name}{{quantile="{q}"}} {value}')
++        lines += [f"{self.name}_sum {self.sum}", f"{self.name}_count {self.count}"]
++        return lines
++
++
++requests_total: Counter = Counter()  # (path, status) -> count
++batch_size = Histogram("tirex_batch_size", "Series per model call.", BATCH_BUCKETS)
++queue_wait = Histogram(
++    "tirex_queue_wait_seconds", "Time from request arrival until its model call started.", LATENCY_BUCKETS
++)
++model_latency = Histogram("tirex_model_latency_seconds", "Duration of one model call.", LATENCY_BUCKETS)
++request_latency = WindowSummary(
++    "tirex_request_latency_seconds", "End-to-end forecast request latency (quantiles over the last 1000 requests)."
++)
++
++
++def render() -> str:
++    lines = ["# HELP tirex_requests_total Forecast requests served.", "# TYPE tirex_requests_total counter"]
++    for (path, status), n in sorted(requests_total.items()):
++        lines.append(f'tirex_requests_total{{path="{path}",status="{status}"}} {n}')
++    for metric in (batch_size, queue_wait, model_latency, request_latency):
++        lines += metric.render()
++    return "\n".join(lines) + "\n"
++
++
++class _RequestTimer:
++    """Pure ASGI middleware (streams for /mcp pass through untouched) timing forecast requests."""
++
++    def __init__(self, app):
++        self.app = app
++
++    async def __call__(self, scope, receive, send):
++        if scope["type"] != "http" or not scope["path"].startswith(FORECAST_PATHS):
++            return await self.app(scope, receive, send)
++        start, status = time.perf_counter(), 500
++
++        async def send_and_capture(message):
++            nonlocal status
++            if message["type"] == "http.response.start":
++                status = message["status"]
++            await send(message)
++
++        try:
++            await self.app(scope, receive, send_and_capture)
++        finally:
++            requests_total[(scope["path"], status)] += 1
++            request_latency.observe(time.perf_counter() - start)
++
++
++def install(app: FastAPI) -> None:
++    """Add request timing and a Prometheus-format GET /metrics to ``app``."""
++    app.add_middleware(_RequestTimer)
++
++    @app.get("/metrics", include_in_schema=False)
++    async def metrics() -> PlainTextResponse:  # async: runs on the loop thread, where the observations happen
++        return PlainTextResponse(render(), media_type="text/plain; version=0.0.4")
